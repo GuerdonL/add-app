@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -euo pipefail
+APP_VERSION="0.1.0"
+
+# ---------- config ----------
+USER_BIN="$HOME/.local/bin"
+USER_REG="$HOME/.local/share/add-app/registry.tsv"
+GLOBAL_BIN="/usr/local/bin"
+GLOBAL_REG="/usr/local/share/add-app/registry.tsv"
+
+usage() {
+  cat <<USAGE
+Usage:
+  add-app <path/to/AppImage> [options]
+  add-app --list
+  add-app --where <NAME>
+  add-app --uninstall <NAME>
+
+Options (can appear before or after the AppImage):
+  -n, --name NAME      Command name (default: appimage basename without extension)
+  -g, --global         Install to /usr/local/bin (requires sudo)
+  -f, --force          Overwrite existing command if present
+  -h, --help           Show this help
+
+Examples:
+  add-app ./nvim.appimage
+  add-app ./nvim.appimage -n nvim
+  add-app -g -f ./bat.AppImage --name bat
+USAGE
+}
+
+# Ensure dirs exist (user scope)
+init_user_dirs() {
+  mkdir -p "$USER_BIN" "$(dirname "$USER_REG")"
+  [[ -f "$USER_REG" ]] || : >"$USER_REG"
+}
+
+# Ensure dirs exist (global scope) - uses sudo for dirs/registry
+init_global_dirs() {
+  sudo mkdir -p "$GLOBAL_BIN" "$(dirname "$GLOBAL_REG")"
+  if ! sudo test -f "$GLOBAL_REG"; then
+    echo -n | sudo tee "$GLOBAL_REG" >/dev/null
+  fi
+}
+
+# Write/replace entry in registry (TSV)
+# fields: scope<TAB>name<TAB>dest_path<TAB>source_path<TAB>timestamp
+reg_upsert() {
+  local scope="$1" name="$2" dest="$3" src="$4" ts
+  ts="$(date -Is)"
+  local reg_file="$USER_REG"
+  [[ "$scope" == "global" ]] && reg_file="$GLOBAL_REG"
+
+  # remove existing entry for name
+  if [[ "$scope" == "global" ]]; then
+    sudo awk -v n="$name" -v s="$scope" -F'\t' '!( $1==s && $2==n )' "$reg_file" | \
+      sudo tee "$reg_file" >/dev/null
+    echo -e "$scope\t$name\t$dest\t$src\t$ts" | sudo tee -a "$reg_file" >/dev/null
+  else
+    awk -v n="$name" -v s="$scope" -F'\t' '!( $1==s && $2==n )' "$reg_file" > "$reg_file.tmp" || true
+    mv "$reg_file.tmp" "$reg_file"
+    echo -e "$scope\t$name\t$dest\t$src\t$ts" >> "$reg_file"
+  fi
+}
+
+# Remove entry from registry
+reg_delete() {
+  local scope="$1" name="$2"
+  local reg_file="$USER_REG"
+  [[ "$scope" == "global" ]] && reg_file="$GLOBAL_REG"
+
+  if [[ "$scope" == "global" ]]; then
+    sudo awk -v n="$name" -v s="$scope" -F'\t' '!( $1==s && $2==n )' "$reg_file" | \
+      sudo tee "$reg_file" >/dev/null
+  else
+    awk -v n="$name" -v s="$scope" -F'\t' '!( $1==s && $2==n )' "$reg_file" > "$reg_file.tmp" || true
+    mv "$reg_file.tmp" "$reg_file"
+  fi
+}
+
+# Show combined list (user + global) if accessible
+cmd_list() {
+  [[ -f "$USER_REG" ]] && awk -F'\t' 'NF{print}' "$USER_REG" || true
+  if [[ -r "$GLOBAL_REG" ]]; then
+    awk -F'\t' 'NF{print}' "$GLOBAL_REG"
+  elif sudo test -r "$GLOBAL_REG" 2>/dev/null; then
+    sudo awk -F'\t' 'NF{print}' "$GLOBAL_REG"
+  fi | cat
+}
+
+# Find where a name is installed (user preferred, then global)
+cmd_where() {
+  local name="$1"
+  # user
+  if [[ -f "$USER_REG" ]] && awk -F'\t' -v n="$name" '$2==n{print;exit}' "$USER_REG" >/dev/null; then
+    awk -F'\t' -v n="$name" '$2==n{print $3; exit}' "$USER_REG"; return
+  fi
+  # global
+  if ( [[ -r "$GLOBAL_REG" ]] || sudo test -r "$GLOBAL_REG" 2>/dev/null ); then
+    ( [[ -r "$GLOBAL_REG" ]] && awk -F'\t' -v n="$name" '$2==n{print $3; exit}' "$GLOBAL_REG" \
+      || sudo awk -F'\t' -v n="$name" '$2==n{print $3; exit}' "$GLOBAL_REG" ) && return
+  fi
+  # fallback: which
+  command -v "$name" 2>/dev/null || { echo "Not found: $name" >&2; return 1; }
+}
+
+# Uninstall by name (remove binary + registry entry)
+cmd_uninstall() {
+  local name="$1" removed=0
+  # user
+  if [[ -f "$USER_REG" ]] && awk -F'\t' -v n="$name" '$2==n{print $3;exit}' "$USER_REG" >/dev/null; then
+    local p; p="$(awk -F'\t' -v n="$name" '$2==n{print $3;exit}' "$USER_REG")"
+    rm -f -- "$p" && removed=1 || true
+    reg_delete "user" "$name"
+  fi
+  # global
+  if ( [[ -r "$GLOBAL_REG" ]] || sudo test -r "$GLOBAL_REG" 2>/dev/null ); then
+    local p
+    p="$(( [[ -r "$GLOBAL_REG" ]] && awk -F'\t' -v n="$name" '$2==n{print $3;exit}' "$GLOBAL_REG" ) || true)"
+    if [[ -z "$p" ]]; then
+      p="$(sudo awk -F'\t' -v n="$name" '$2==n{print $3;exit}' "$GLOBAL_REG" 2>/dev/null || true)"
+    fi
+    if [[ -n "$p" ]]; then
+      sudo rm -f -- "$p" && removed=1 || true
+      reg_delete "global" "$name"
+    fi
+  fi
+  if [[ $removed -eq 1 ]]; then
+    echo "Uninstalled: $name"
+  else
+    echo "Nothing removed for: $name" >&2
+    return 1
+  fi
+}
+
+# ---------- parse subcommands first ----------
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    --help|-h) usage; exit 0 ;;
+    --list)    cmd_list | awk -F'\t' '{printf "%-6s  %-20s  %-s\n",$1,$2,$3}'; exit 0 ;;
+    --where)   [[ $# -ge 2 ]] || { echo "Usage: add-app --where <NAME>" >&2; exit 2; }
+               cmd_where "$2"; exit $? ;;
+    --uninstall) [[ $# -ge 2 ]] || { echo "Usage: add-app --uninstall <NAME>" >&2; exit 2; }
+               cmd_uninstall "$2"; exit $? ;;
+    --version|-v) echo "add-app $APP_VERSION"; exit 0 ;;
+  esac
+fi
+
+# ---------- install mode ----------
+APP=""; NAME=""; GLOBAL=0; FORCE=0
+
+# order-agnostic flags + positional APP
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--name)    NAME="${2-}"; [[ -n "${NAME}" ]] || { echo "Error: --name requires value" >&2; exit 2; }; shift 2 ;;
+    -g|--global)  GLOBAL=1; shift ;;
+    -f|--force)   FORCE=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; break ;;
+    -*)
+      echo "Unknown option: $1" >&2; usage; exit 2 ;;
+    *)  if [[ -z "$APP" ]]; then APP="$1"; else echo "Unexpected arg: $1" >&2; usage; exit 2; fi; shift ;;
+  esac
+done
+# allow tail arg after --
+if [[ -z "${APP}" && $# -gt 0 ]]; then APP="$1"; shift; fi
+
+[[ -n "$APP" ]] || { echo "Error: missing AppImage path" >&2; usage; exit 2; }
+[[ -f "$APP" ]] || { echo "Error: file not found: $APP" >&2; exit 1; }
+
+APP_ABS="$(readlink -f "$APP")"
+chmod +x "$APP_ABS" || true
+
+# default name: basename without extension, spaces -> dashes
+if [[ -z "$NAME" ]]; then
+  base="$(basename "$APP_ABS")"
+  NAME="${base%.*}"
+  NAME="${NAME// /-}"
+fi
+
+# scope + destinations
+if [[ $GLOBAL -eq 1 ]]; then
+  init_global_dirs
+  DEST_DIR="$GLOBAL_BIN"; REG="$GLOBAL_REG"; SUDO=sudo; SCOPE="global"
+else
+  init_user_dirs
+  DEST_DIR="$USER_BIN";   REG="$USER_REG";   SUDO="";     SCOPE="user"
+fi
+
+DEST_PATH="$DEST_DIR/$NAME"
+
+# overwrite?
+if [[ -e "$DEST_PATH" && $FORCE -ne 1 ]]; then
+  echo "Error: $DEST_PATH exists. Use -f to overwrite or -n for another name." >&2
+  exit 1
+fi
+
+# perform copy
+if [[ -n "$SUDO" ]]; then
+  sudo cp -f "$APP_ABS" "$DEST_PATH"
+  sudo chmod +x "$DEST_PATH"
+else
+  cp -f "$APP_ABS" "$DEST_PATH"
+  chmod +x "$DEST_PATH"
+fi
+
+# update registry
+reg_upsert "$SCOPE" "$NAME" "$DEST_PATH" "$APP_ABS"
+
+echo "Installed: $DEST_PATH"
+echo "Run with:  $NAME"
+
+# verify PATH contains destination dir
+if [[ ":$PATH:" != *":$DEST_DIR:"* ]]; then
+  echo "⚠ $DEST_DIR is not in your PATH."
+  if [[ $SCOPE == "user" ]]; then
+    echo '   Add it now for this shell:'
+    echo "     export PATH=\"$DEST_DIR:\$PATH\""
+    echo '   And persist by adding to ~/.bashrc or ~/.zshrc'
+  else
+    echo '   Add it to /etc/environment or /etc/profile for all users.'
+  fi
+fi
