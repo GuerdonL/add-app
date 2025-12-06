@@ -11,10 +11,10 @@ Features:
 ## Install
 
 Quick (via install.sh):
-    GH_USER=YOUR_GITHUB_USERNAME bash -c 'curl -fsSL https://raw.githubusercontent.com/$GH_USER/add-app/main/install.sh | bash'
+    bash -c 'curl -fsSL https://raw.githubusercontent.com/GuerdonL/add-app/main/install.sh | bash'
 
 Manual:
-    curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/add-app/main/bin/add-app -o ~/.local/bin/add-app
+    curl -fsSL https://raw.githubusercontent.com/GuerdonL/add-app/main/bin/add-app -o ~/.local/bin/add-app
     chmod +x ~/.local/bin/add-app
 
 Make sure ~/.local/bin is on your PATH.
